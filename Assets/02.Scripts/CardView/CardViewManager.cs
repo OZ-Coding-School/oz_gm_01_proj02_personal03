@@ -48,6 +48,9 @@ public class CardViewManager : MonoBehaviour
 
         pools[CardAreaType.AICapturedCard] =
             new ObjectPooling<CardView>(cardViewPrefab, AICapturedCardArea, preload: 20);
+        
+        pools[CardAreaType.Deck] =
+            new ObjectPooling<CardView>(cardViewPrefab, DeckArea, preload: 48);
     }
 
     public CardView GetCard(CardData data, CardAreaType area, bool front)

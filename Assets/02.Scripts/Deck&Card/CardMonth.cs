@@ -4,6 +4,7 @@ using UnityEngine;
 
 public enum CardMonth
 {
+    None,
     Jan = 1,
     Feb = 2,
     Mar = 3,

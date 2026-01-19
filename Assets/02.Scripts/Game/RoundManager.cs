@@ -13,10 +13,18 @@ public enum RoundState
     Settlement,     //정산
     End             //라운드 끝
 }
-
+public enum ResolveSource
+{ 
+    Hand,
+    Draw
+}
 
 public class RoundManager : Singleton<RoundManager>
 {
+    [SerializeField] private Transform distributionTempRoot;
+
+    private Dictionary<CardMonth, TableSlot> previewSlotMap = new Dictionary<CardMonth, TableSlot>();
+
     protected override bool IsDontDestroyOnLoad => false;
 
     public static event Action<RoundState> OnRoundStateChanged;
@@ -37,10 +45,18 @@ public class RoundManager : Singleton<RoundManager>
     private Coroutine roundRoutine;
     private Coroutine arrangeRoutine;
 
+    private Player pendingPlayer;
+    private CardData pendingPlayedCard;
+    private List<CardData> pendingSelectCards;
+
+    private ResolveSource pendingResolveSource;
+
     //Stop선언 종료 플래그
     private bool isStoped = false;
 
     public RoundState CurrentState;
+
+    
 
     protected override void Awake()
     {
@@ -73,32 +89,7 @@ public class RoundManager : Singleton<RoundManager>
     private IEnumerator RoundRoutine()
     {
         //====================Distribution=====================
-        ChangeState(RoundState.Distribution);
-
-        DeckManager.Instance.InitializeDeck(true);
-        tableCards.Clear();
-
-        humanPlayer.Hand.Clear();
-        aiPlayer.Hand.Clear();
-
-        for(int i = 0; i < 8; i++)
-        {
-            tableCards.Add(DeckManager.Instance.Draw());
-        }
-        for(int i = 0; i < 10; i++)
-        {
-            humanPlayer.Hand.Add(DeckManager.Instance.Draw());
-            aiPlayer.Hand.Add(DeckManager.Instance.Draw());
-        }
-
-        Debug.Log("===== 카드 분배 완료 =====");
-        Debug.Log($"Human Hand : {humanPlayer.Hand.Count}장");
-        Debug.Log($"AI Hand    : {aiPlayer.Hand.Count}장");
-        Debug.Log($"Table      : {tableCards.Count}장");
-        Debug.Log($"Deck Remain: {DeckManager.Instance.Count}장");
-        
-        ShowDistributionViews();
-        RequestArrangeHands();
+        yield return StartCoroutine(PlayDistributionAnmaition());
         //======================================================
         //======================Turn Loop=======================
         while (true)
@@ -109,11 +100,19 @@ public class RoundManager : Singleton<RoundManager>
             
             while(true)
             {
-                if(humanPlayer.SelectIndex >=0)
+                if (humanPlayer.SelectIndex >= 0)
                 {
-                    turnResolver.ExecuteTurn(humanPlayer, tableCards);
-                    break;
+                    var result = turnResolver.ExecuteTurn(humanPlayer, tableCards);
+
+                    if (result == TurnExecuteResult.WaitingSelection)
+                    {
+                        yield return new WaitUntil(() => CurrentState != RoundState.Resolve);
+                        continue; // 선택 끝난 뒤 턴 재개
+                    }
+
+                    break; // 턴 정상 종료
                 }
+
                 yield return null;
             }
 
@@ -134,6 +133,7 @@ public class RoundManager : Singleton<RoundManager>
             //==============AITurn==============
             ChangeState(RoundState.OpponentTurn);
             aiScore.BeginTurn();
+
             turnResolver.ExecuteTurn(aiPlayer, tableCards);
 
             RefreshHandAndTableView();
@@ -146,12 +146,11 @@ public class RoundManager : Singleton<RoundManager>
             aiGoStop.JudgeAfterTurn(aiScore);
 
             yield return StartCoroutine(HandleGoStop(aiPlayer, aiScore, aiGoStop));
+            
             if(CheckRoundEnd())
             {
                 break;
-            }
-
-            yield return null;   
+            } 
         }
         //======================================================
         //=========================End==========================
@@ -250,24 +249,19 @@ public class RoundManager : Singleton<RoundManager>
     {
         CardViewManager.Instance.ClearArea(CardAreaType.HumanHandCard);
         CardViewManager.Instance.ClearArea(CardAreaType.AIHandCard);
-        CardViewManager.Instance.ClearArea(CardAreaType.TableCard);
 
-        foreach(var card in tableCards)
-        {
-           var v = CardViewManager.Instance.GetCard(card, CardAreaType.TableCard, true);
-            v.BindHandIndex(-1, clickable: false);
-        }
+        RebuildTableView();
 
         for(int i = 0; i<humanPlayer.Hand.Count; i++)
         {
-            var v = CardViewManager.Instance.GetCard(humanPlayer.Hand[i], CardAreaType.HumanHandCard, true);
-            v.BindHandIndex(i, clickable: true);
+            var view = CardViewManager.Instance.GetCard(humanPlayer.Hand[i], CardAreaType.HumanHandCard, true);
+            view.BindHandIndex(i, clickable: true);
         }
 
         for (int i = 0; i < aiPlayer.Hand.Count; i++)
         {
-            var v = CardViewManager.Instance.GetCard(aiPlayer.Hand[i], CardAreaType.AIHandCard, false);
-            v.BindHandIndex(-1, clickable: false);
+            var view = CardViewManager.Instance.GetCard(aiPlayer.Hand[i], CardAreaType.AIHandCard, false);
+            view.BindHandIndex(-1, clickable: false);
         }
     }
 
@@ -302,13 +296,7 @@ public class RoundManager : Singleton<RoundManager>
             view.BindHandIndex(-1, clickable: false);
         }
 
-        //Table
-        CardViewManager.Instance.ClearArea(CardAreaType.TableCard);
-        foreach(var card in tableCards)
-        {
-            var v = CardViewManager.Instance.GetCard(card, CardAreaType.TableCard, true);
-            v.BindHandIndex(-1, clickable: false);
-        }
+        RebuildTableView();
 
         RequestArrangeHands();
     }
@@ -364,5 +352,261 @@ public class RoundManager : Singleton<RoundManager>
 
         ArrangeHands();
         arrangeRoutine = null;
+    }
+
+    //선택 요청 메서드
+    public void RequestCaptureSelection(Player player, CardData playedCard, List<CardData> candidates, ResolveSource source)
+    {
+        ChangeState(RoundState.Resolve);
+
+        pendingPlayer = player;
+        pendingPlayedCard = playedCard;
+        pendingResolveSource = source;
+
+        if (player is AIPlayer)
+        {
+            ResolveSelectedCapture(candidates[0]);
+            return;
+        }
+
+        //UI 띄우기
+        CaptureSelectUI.Instance.ShowCardSelect(candidates, selected => { ResolveSelectedCapture(selected); });
+    }
+
+    //선택 확정 메서드
+    public void ResolveSelectedCapture(CardData selected)
+    {
+        // Human 선택 확정
+        ResolveSelectedCaptureInternal(pendingPlayer, pendingPlayedCard, selected, pendingResolveSource);
+
+        // pending 정리
+        pendingPlayer = null;
+        pendingPlayedCard = null;
+        pendingSelectCards = null;
+    }
+
+    private void ResolveSelectedCaptureInternal(Player player, CardData playedCard, CardData selected, ResolveSource source)
+    {
+        if(player == null || playedCard == null || selected == null)
+        {
+            return;
+        }
+
+        if(source == ResolveSource.Hand)
+        {
+            player.PlayCard(playedCard);
+        }
+
+        player.AddCapturedCard(playedCard);
+        player.AddCapturedCard(selected);
+        tableCards.Remove(selected);
+
+        CapturedCardManager.Instance.RefreshCaptured(player);
+
+        player.ClearPlayedCard();
+
+        RefreshHandAndTableView();
+
+        ResumeAfterResolve(source);
+    }
+
+    public void ResolveSelectedCaptureInternalDirect(
+    Player player,
+    CardData playedCard,
+    CardData selected,
+    ResolveSource source)
+    {
+        if (player == null || playedCard == null)
+            return;
+
+        // 손에서 낸 카드 제거
+        if (source == ResolveSource.Hand)
+        {
+            player.PlayCard(playedCard);
+        }
+
+        // 캡처 성공
+        if (selected != null)
+        {
+            player.AddCapturedCard(playedCard);
+            player.AddCapturedCard(selected);
+            tableCards.Remove(selected);
+        }
+        else
+        {
+            // 못 먹으면 테이블로
+            tableCards.Add(playedCard);
+        }
+
+        player.ClearPlayedCard();
+        CapturedCardManager.Instance.RefreshCaptured(player);
+        RefreshHandAndTableView();
+
+        // 턴 복귀
+        ResumeAfterResolve(source);
+    }
+
+    private void ResumeAfterResolve(ResolveSource source)
+    {
+        if (source == ResolveSource.Hand)
+        {
+            ChangeState(RoundState.PlayerTurn);
+            return;
+        }
+        ChangeState(RoundState.OpponentTurn);
+    }
+
+    private void RebuildTableView()
+    {
+        CardViewManager.Instance.ClearArea(CardAreaType.TableCard);
+
+        TableSlotManager.Instance.ClearAll();
+
+        foreach (var card in tableCards)
+        {
+            if (card == null) continue;
+
+            var view = CardViewManager.Instance.GetCard(card, CardAreaType.TableCard, front: true);
+            view.BindHandIndex(-1, clickable: false);
+
+            TableSlotManager.Instance.PlaceCard(view, card);
+        }
+    }
+
+    private IEnumerator PlayDistributionAnmaition()
+    {
+        ChangeState(RoundState.Distribution);
+
+        tableCards.Clear();
+        humanPlayer.Hand.Clear();
+        aiPlayer.Hand.Clear();
+
+        DeckManager.Instance.InitializeDeck(true);
+
+        Transform deck = CardViewManager.Instance.GetAreaTransform(CardAreaType.Deck);
+
+        // 1. 바닥 4장
+        previewSlotMap.Clear();
+        yield return StartCoroutine(DealToTable(4, deck));
+
+        // 2. AI 5장
+        yield return StartCoroutine(DealToPlayer(aiPlayer, CardAreaType.AIHandCard, 5, deck));
+
+        // 3. Human 5장
+        yield return StartCoroutine(DealToPlayer(humanPlayer, CardAreaType.HumanHandCard, 5, deck));
+
+        // 4. 바닥 4장
+        previewSlotMap.Clear();
+        yield return StartCoroutine(DealToTable(4, deck));
+
+        // 5. AI 5장
+        yield return StartCoroutine(DealToPlayer(aiPlayer, CardAreaType.AIHandCard, 5, deck));
+
+        // 6. Human 5장
+        yield return StartCoroutine(DealToPlayer(humanPlayer, CardAreaType.HumanHandCard, 5, deck));
+    }
+
+    private IEnumerator DealToTable(int count, Transform deck)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            CardData card = DeckManager.Instance.Draw();
+            tableCards.Add(card);
+
+            var view = CardViewManager.Instance.GetCard(card, CardAreaType.Deck, true);
+            
+            view.transform.SetParent(distributionTempRoot, worldPositionStays: true);
+            view.transform.position = deck.position;
+
+            Vector3 center = GetReservedPreviewPosition(card.month);
+
+            // 같은 슬롯 안에서도 살짝 퍼지게 (선택)
+            float spreadX = UnityEngine.Random.Range(-20f, 20f);
+            float spreadY = UnityEngine.Random.Range(-10f, 10f);
+
+            Vector3 target = center + new Vector3(spreadX, spreadY, 0f);
+
+            bool done = false;
+            view.PlayMoveTo(target, 0.25f, () => done = true);
+
+            yield return new WaitUntil(() => done);
+            yield return new WaitForSeconds(0.05f);
+        }
+
+        RebuildTableView(); // 정렬은 마지막에 한 번
+    }
+
+    private IEnumerator DealToPlayer(
+     Player player,
+     CardAreaType area,
+     int count,
+     Transform deck)
+    {
+        Transform handArea =
+            CardViewManager.Instance.GetAreaTransform(area);
+
+        float fanAngle = 40f;     // 전체 부채꼴 각도
+        float radius = 120f;      // 부채 반경
+        float startAngle = -fanAngle * 0.5f;
+        float step = (count == 1) ? 0f : fanAngle / (count - 1);
+
+        for (int i = 0; i < count; i++)
+        {
+            CardData card = DeckManager.Instance.Draw();
+            player.Hand.Add(card);
+
+            var view = CardViewManager.Instance.GetCard(
+                card,
+                CardAreaType.Deck, 
+                area == CardAreaType.HumanHandCard
+            );
+
+            // 임시 루트 유지
+            view.transform.SetParent(distributionTempRoot, true);
+            view.transform.position = deck.position;
+
+            float angle = startAngle + step * i;
+            Vector3 offset =
+                Quaternion.Euler(0, 0, angle) * Vector3.up * radius;
+
+            Vector3 target = handArea.position + offset;
+
+            bool done = false;
+            view.PlayMoveTo(target, 0.25f, () => done = true);
+
+            yield return new WaitUntil(() => done);
+            yield return new WaitForSeconds(0.05f);
+        }
+
+
+        RefreshHandAndTableView();
+
+        CardViewManager.Instance.ClearArea(CardAreaType.Deck);
+        distributionTempRoot.DetachChildren();
+    }
+
+    private Vector3 GetReservedPreviewPosition(CardMonth month)
+    {
+        // 1. 이미 이 월이 예약돼 있으면 같은 슬롯 사용
+        if (previewSlotMap.TryGetValue(month, out var reservedSlot))
+        {
+            return reservedSlot.root.position;
+        }
+
+        // 2. 아직 예약 안 된 월 → 빈 슬롯 중 하나 예약
+        var slots = TableSlotManager.Instance.GetAllSlots();
+
+        foreach (var slot in slots)
+        {
+            // 아직 실제로도 비어 있고, 프리뷰 예약도 안 된 슬롯
+            if (slot.IsEmpty && !previewSlotMap.ContainsValue(slot))
+            {
+                previewSlotMap[month] = slot;
+                return slot.root.position;
+            }
+        }
+
+        // 3. 예외 상황 (슬롯 부족)
+        return TableSlotManager.Instance.transform.position;
     }
 }

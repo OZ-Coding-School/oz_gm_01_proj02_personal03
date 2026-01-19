@@ -2,60 +2,75 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
+public enum TurnExecuteResult
+{
+    Completed,
+    WaitingSelection
+}
+
+
 public sealed class TurnResolver
 {
     private readonly CaptureResolver captureResolver = new CaptureResolver();
 
-    public void ExecuteTurn(Player player, List<CardData> tableCards)
+    public TurnExecuteResult ExecuteTurn(Player player, List<CardData> tableCards)
     {
-        if(player == null)
-        {
-            Debug.LogError("[TurnResolver] Player is null");
-            return;
-        }
-        if(tableCards == null)
-        {
-            Debug.LogError("[TurnResolver] tableCards null");
-            return;
-        }
-
-        bool capturedThisTurn = false;
-
-        Debug.Log($"======== 턴 시작 : {player.Name} ========");
-
-
         //손에서 카드 선택
-        CardData selected = SelectCard(player);
-
-        if(player is HumanPlayer && selected == null)
+        CardData played = SelectCard(player);
+        if (player == null)
         {
-            Debug.LogWarning($"[TurnResolver] {player.Name} 입력 대기중.");
-            return;
+            return TurnExecuteResult.Completed;
         }
 
-        //손에서 카드 제거, PlayedCard 기록
-        player.PlayCard(selected);
-        Debug.Log($"[Play] {player.Name} -> {selected.DebugName}");
-
+        var handResult = captureResolver.Resolve(played, tableCards);
         //바닥과 손에서 낸 카드 판정
-        captureResolver.Resolve(player, selected, tableCards);
+        if (handResult.needSelect)
+        {
+            RoundManager.Instance.RequestCaptureSelection(
+                player,
+                played,
+                handResult.selectableCards,
+                ResolveSource.Hand
+            );
+            return TurnExecuteResult.WaitingSelection;
+        }
 
-        player.ClearPlayedCard();
-
+        // 선택 필요 없을 때만 손에서 제거
+        RoundManager.Instance.ResolveSelectedCaptureInternalDirect(
+        player,
+        played,
+        handResult.capturedCards?[1],
+        ResolveSource.Hand
+    );
         //덱에서 카드 1장 드로우
         CardData draw = DeckManager.Instance.Draw();
-        if(draw == null)
+        if (draw == null)
         {
-            Debug.LogWarning("[TurnResolver] 덱이 비었습니다. 드로우 할 수 없음");
-            Debug.Log($"----- 턴 종료 : {player.Name} -----");
-            return;
+            return TurnExecuteResult.Completed;
         }
-        Debug.Log($"[Draw] {player.Name}이 드로우 -> {draw.DebugName}");
 
         //바닥과 드로우 카드 판정
-        captureResolver.Resolve(player, draw, tableCards);
+        var drawResult = captureResolver.Resolve(draw, tableCards);
 
-        Debug.Log($"----- 턴 종료 : {player.Name} -----");
+        if (drawResult.needSelect)
+        {
+            RoundManager.Instance.RequestCaptureSelection(
+                player,
+                draw,
+                drawResult.selectableCards,
+                ResolveSource.Draw
+            );
+            return TurnExecuteResult.WaitingSelection;
+        }
+
+        RoundManager.Instance.ResolveSelectedCaptureInternalDirect(
+           player,
+           draw,
+           drawResult.capturedCards?[1],
+           ResolveSource.Draw
+        );
+
+        return TurnExecuteResult.Completed;
     }
 
     private CardData SelectCard(Player player)
@@ -70,11 +85,6 @@ public sealed class TurnResolver
             return aiplayer.SelectCard();
         }
 
-        if(player.Hand.Count == 0)
-        {
-            return null;
-        }
-
-        return player.Hand[0];
+        return null;
     }
 }

@@ -87,13 +87,8 @@ public class CardView : MonoBehaviour, IPointerClickHandler,IPointerEnterHandler
         {
             return;
         }
-        //내 턴 상태일때만 클릭 가능
-        if(RoundManager.Instance.CurrentState != RoundState.PlayerTurn)
-        {
-            return;
-        }
 
-        if(HandIndex < 0)
+        if(areaType != CardAreaType.HumanHandCard)
         {
             return;
         }
@@ -179,9 +174,20 @@ public class CardView : MonoBehaviour, IPointerClickHandler,IPointerEnterHandler
         IsClickable = false;
     }
 
+    public void PlayMoveTo(Vector3 worldTarget, float duration, System.Action onComplete = null)
+    {
+        transform.DOKill();
+
+        transform.DOMove(worldTarget, duration).SetEase(Ease.OutQuad).OnComplete(() => onComplete?.Invoke());
+    }
+
     private bool CanInteract()
     {
-        return areaType == CardAreaType.HumanHandCard && IsClickable && RoundManager.Instance.CurrentState == RoundState.PlayerTurn;
+        if (RoundManager.Instance.CurrentState != RoundState.PlayerTurn &&
+           RoundManager.Instance.CurrentState != RoundState.Resolve)
+            return false;
+
+        return IsClickable;
     }
 
     public CardData Data => data;
